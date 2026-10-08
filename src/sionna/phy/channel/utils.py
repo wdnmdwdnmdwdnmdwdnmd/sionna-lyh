@@ -4,11 +4,13 @@
 #
 """Utility functions for the channel module"""
 
+import numbers
 import warnings
 from typing import Optional, Tuple
 
 import torch
 
+from sionna._validation import check_instance, check_tensor_all
 from sionna.phy import PI, config, dtypes
 from sionna.phy.utils import expand_to_rank, sample_bernoulli
 from sionna.phy.utils.random import rand, randint
@@ -20,6 +22,9 @@ __all__ = [
     "cir_to_ofdm_channel",
     "cir_to_time_channel",
     "time_to_ofdm_channel",
+    "ofdm_to_time_channel",
+    "time_to_doppler_channel",
+    "ofdm_to_delay_doppler_channel",
     "deg_2_rad",
     "rad_2_deg",
     "wrap_angle_0_360",
@@ -79,8 +84,6 @@ def subcarrier_frequencies(
 
     if device is None:
         device = config.device
-    generator = config.torch_rng(device)
-    generator = config.torch_rng(device)
 
     start = -(num_subcarriers // 2)
     if num_subcarriers % 2 == 0:
@@ -281,7 +284,6 @@ def cir_to_ofdm_channel(
 
     # Bring all tensors to broadcastable shapes
     tau = tau.unsqueeze(-1)
-    h = a.unsqueeze(-1)
     # Ensure frequencies is on the same device as tau
     frequencies = frequencies.to(device=tau.device, dtype=tau.dtype)
     frequencies = expand_to_rank(frequencies, tau.dim(), axis=0)
@@ -294,9 +296,8 @@ def cir_to_ofdm_channel(
             -2 * PI * frequencies * tau,
         )
     )
-    h_f = h * e
-    # Sum over all clusters to get the channel frequency responses
-    h_f = h_f.sum(dim=-3)
+    # Multiply and sum over all paths without materializing the broadcast product
+    h_f = torch.einsum("...pn,...puf->...nf", a, e)
 
     if normalize:
         # Normalization is performed such that for each batch example and
@@ -418,14 +419,21 @@ def time_to_ofdm_channel(
     channel impulse response
 
     Given a discrete complex-baseband channel impulse response
-    :math:`\bar{h}_{b,\ell}`, for :math:`\ell` ranging from :math:`L_\text{min}\le 0`
-    to :math:`L_\text{max}`, the discrete channel frequency response is computed as
+    :math:`\bar{h}_{b,\ell}`, for :math:`\ell` ranging from
+    :math:`L_\text{min}` to :math:`L_\text{max}`, the discrete channel
+    frequency response is computed as
 
     .. math::
 
-        \hat{h}_{b,n} = \sum_{k=0}^{L_\text{max}} \bar{h}_{b,k} e^{-j \frac{2\pi kn}{N}} + \sum_{k=L_\text{min}}^{-1} \bar{h}_{b,k} e^{-j \frac{2\pi n(N+k)}{N}}, \quad n=0,\dots,N-1
+        \hat{h}_{b,n}
+        = \sum_{\ell=L_\text{min}}^{L_\text{max}}
+          \bar{h}_{b,\ell}e^{-j\frac{2\pi n\ell}{N}},
+        \quad n=0,\dots,N-1
 
-    where :math:`N` is the FFT size and :math:`b` is the time step.
+    where :math:`N` is the FFT size, :math:`b` is the time step,
+    :math:`n` is the frequency-bin index, and :math:`\ell` is the time-lag
+    index. The FFT input stores the tap for lag :math:`\ell` at index
+    :math:`\ell \bmod N`.
 
     This function only produces one channel frequency response per OFDM symbol, i.e.,
     only values of :math:`b` corresponding to the start of an OFDM symbol (after
@@ -443,16 +451,18 @@ def time_to_ofdm_channel(
     .. rubric:: Notes
 
     Note that the result of this function is generally different from the
-    output of :meth:`~sionna.phy.channel.utils.cir_to_ofdm_channel` because
+    output of :func:`~sionna.phy.channel.cir_to_ofdm_channel` because
     the discrete complex-baseband channel impulse response is truncated
-    (see :meth:`~sionna.phy.channel.utils.cir_to_time_channel`). This effect
+    (see :func:`~sionna.phy.channel.cir_to_time_channel`). This effect
     can be observed in the example below.
 
     .. rubric:: Examples
 
     .. code-block:: python
 
+        import matplotlib.pyplot as plt
         import torch
+        from sionna.phy import config
         from sionna.phy.channel import (subcarrier_frequencies,
             cir_to_ofdm_channel, cir_to_time_channel,
             time_lag_discrete_time_channel, time_to_ofdm_channel)
@@ -460,6 +470,7 @@ def time_to_ofdm_channel(
         from sionna.phy.ofdm import ResourceGrid
 
         # Setup resource grid and channel model
+        config.seed = 42
         rg = ResourceGrid(num_ofdm_symbols=1,
                           fft_size=1024,
                           subcarrier_spacing=15e3)
@@ -478,6 +489,27 @@ def time_to_ofdm_channel(
 
         # Generate OFDM channel from time channel
         h_freq_hat = time_to_ofdm_channel(h_time, rg, l_min).squeeze()
+
+        # Compare the two frequency responses
+        plt.figure(figsize=(7, 5))
+        plt.plot(h_freq.real.cpu(), label="OFDM channel (real)")
+        plt.plot(h_freq_hat.real.cpu(), "--",
+                 label="OFDM channel from time (real)")
+        plt.plot(h_freq.imag.cpu(), label="OFDM channel (imag)")
+        plt.plot(h_freq_hat.imag.cpu(), "--",
+                 label="OFDM channel from time (imag)")
+        plt.xlabel("Subcarrier index")
+        plt.ylabel("Channel frequency response")
+        plt.grid()
+        plt.legend()
+        plt.show()
+
+    .. figure:: /phy/figures/time_to_ofdm_channel.png
+        :align: center
+        :width: 80%
+
+        Frequency responses computed directly from the CIR and from the
+        truncated discrete time channel.
     """
     # Total length of an OFDM symbol including cyclic prefix
     ofdm_length = rg.fft_size + rg.cyclic_prefix_length
@@ -485,8 +517,16 @@ def time_to_ofdm_channel(
     # Downsample the impulse response to one sample per OFDM symbol
     h_t = h_t[..., rg.cyclic_prefix_length : rg.num_time_samples : ofdm_length, :]
 
-    # Pad channel impulse response with zeros to the FFT size
+    # Pad channel impulse response with zeros to the FFT size.
+    # A longer impulse response cannot produce an fft_size frequency response
+    # without truncation; reject instead of silently returning the wrong shape.
     pad_dims = rg.fft_size - h_t.shape[-1]
+    if pad_dims < 0:
+        raise ValueError(
+            "The last dimension of h_t "
+            f"(got {h_t.shape[-1]}) must not exceed rg.fft_size "
+            f"({rg.fft_size})."
+        )
     if pad_dims > 0:
         pad_shape = list(h_t.shape[:-1]) + [pad_dims]
         h_t = torch.cat(
@@ -504,6 +544,368 @@ def time_to_ofdm_channel(
     h_f = torch.fft.fftshift(h_f, dim=-1)
 
     return h_f
+
+
+def ofdm_to_time_channel(
+    h_f: torch.Tensor,
+    l_min: int = 0,
+    l_max: Optional[int] = None,
+) -> torch.Tensor:
+    r"""
+    Compute the discrete complex-baseband channel impulse response from a
+    channel frequency response on a complete OFDM frequency grid
+
+    Given a channel frequency response :math:`\hat{h}_{b,n}`, the channel taps
+    are computed as
+
+    .. math::
+
+        \bar{h}_{b,\ell}
+        = \frac{1}{N}\sum_{n=0}^{N-1}
+          \hat{h}_{b,n}e^{j\frac{2\pi n\ell}{N}},
+
+    for :math:`\ell=L_\text{min},\ldots,L_\text{max}`, where :math:`N` is
+    ``fft_size``, :math:`b` is the time-step index, :math:`n` is the
+    frequency-bin index after undoing the centered subcarrier ordering, and
+    :math:`\ell` is the time-lag index. If ``l_max`` is `None`,
+    :math:`L_\text{max}=L_\text{min}+N-1`.
+
+    :param h_f: Channel frequency responses on a complete, uniformly spaced
+        OFDM frequency grid in centered subcarrier order, shape
+        [..., num_time_steps, fft_size]
+    :param l_min: Smallest time-lag for the discrete complex-baseband channel
+        impulse response (:math:`L_{\text{min}}`). Defaults to 0.
+    :param l_max: Largest time-lag for the discrete complex-baseband channel
+        impulse response (:math:`L_{\text{max}}`). If `None`, all
+        ``fft_size`` lags starting at ``l_min`` are returned. Defaults to
+        `None`.
+
+    :output h_t: [..., num_time_steps, num_time_lags], `torch.complex`.
+        Channel taps ordered from ``l_min`` to ``l_max``. If ``l_max`` is
+        `None`, ``num_time_lags = fft_size``; otherwise,
+        ``num_time_lags = l_max-l_min+1``.
+
+    .. rubric:: Notes
+
+    The last dimension of ``h_f`` must use the centered subcarrier ordering
+    produced by :func:`~sionna.phy.channel.time_to_ofdm_channel`. The inverse
+    DFT represents time lags circularly modulo ``fft_size``; negative lags are
+    reordered according to ``l_min`` before the requested interval is selected.
+    With the default arguments, the canonical circular lags from 0 to
+    ``fft_size-1`` are returned. As lags are only determined modulo
+    ``fft_size``, ``l_min`` must satisfy ``-fft_size < l_min < fft_size``.
+
+    Due to the :math:`1/N` normalization, a path with a delay on the sampling
+    grid appears as a single tap equal to its path coefficient, and the
+    channel energy is preserved,
+    :math:`\sum_{\ell}|\bar{h}_{b,\ell}|^2
+    = \frac{1}{N}\sum_{n=0}^{N-1}|\hat{h}_{b,n}|^2`, if all ``fft_size`` lags
+    are returned. Selecting fewer lags can only reduce the energy.
+
+    This function inverts the Fourier transform and lag reordering performed by
+    :func:`~sionna.phy.channel.time_to_ofdm_channel`, but it cannot reconstruct
+    channel samples discarded by that function's temporal downsampling. The
+    input must contain a complete, uniformly spaced DFT grid; selected or
+    irregularly spaced subcarriers are insufficient.
+
+    Applying this function to the output of
+    :func:`~sionna.phy.channel.cir_to_ofdm_channel` is generally different from
+    calling :func:`~sionna.phy.channel.cir_to_time_channel` on the same channel
+    impulse response. The latter samples a sinc response, whereas this function
+    computes the periodic inverse DFT of a finite frequency grid. Both
+    representations coincide for path delays aligned with the sampling grid,
+    but generally differ for fractional delays.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import matplotlib.pyplot as plt
+        import torch
+        from sionna.phy import config
+        from sionna.phy.channel import (cir_to_ofdm_channel,
+            cir_to_time_channel, ofdm_to_time_channel,
+            subcarrier_frequencies, time_lag_discrete_time_channel)
+        from sionna.phy.channel.tr38901 import TDL
+        from sionna.phy.ofdm import ResourceGrid
+
+        # Setup resource grid and channel model
+        config.seed = 42
+        rg = ResourceGrid(num_ofdm_symbols=1,
+                          fft_size=64,
+                          subcarrier_spacing=240e3)
+        tdl = TDL("A", 100e-9, 3.5e9)
+
+        # Generate CIR and select the time-lag interval
+        cir = tdl(batch_size=1, num_time_steps=1,
+                  sampling_frequency=rg.bandwidth)
+        l_min, l_max = time_lag_discrete_time_channel(rg.bandwidth)
+
+        # Convert the CIR directly to a time channel
+        h_t = cir_to_time_channel(rg.bandwidth, *cir,
+                                  l_min=l_min, l_max=l_max).squeeze()
+
+        # Convert the CIR through the OFDM representation
+        frequencies = subcarrier_frequencies(rg.fft_size,
+                                             rg.subcarrier_spacing)
+        h_f = cir_to_ofdm_channel(frequencies, *cir).squeeze()
+        h_t_from_ofdm = ofdm_to_time_channel(h_f, l_min, l_max).squeeze()
+
+        # Compare the two time-channel representations
+        lags = torch.arange(l_min, l_max + 1)
+        error = (h_t - h_t_from_ofdm).abs().cpu()
+        fig, axes = plt.subplots(2, 1, figsize=(7, 6), sharex=True,
+                                 height_ratios=[2, 1])
+        axes[0].plot(lags, h_t.abs().cpu(), "o-", markersize=3,
+                     label="Sampled sinc response")
+        axes[0].plot(lags, h_t_from_ofdm.abs().cpu(), "x--", markersize=4,
+                     label="Finite-grid inverse DFT")
+        axes[0].set_ylabel("Channel magnitude")
+        axes[0].grid()
+        axes[0].legend()
+        axes[1].semilogy(lags, error, "o-", markersize=3)
+        axes[1].set_xlabel("Time lag")
+        axes[1].set_ylabel("Absolute difference")
+        axes[1].grid()
+        plt.show()
+
+    .. figure:: /phy/figures/ofdm_to_time_channel.png
+        :align: center
+        :width: 80%
+
+        Comparison of the sampled sinc response and the periodic inverse DFT
+        of the corresponding finite OFDM frequency grid.
+    """
+    check_instance(l_min, numbers.Integral, name="l_min")
+    if l_max is not None:
+        check_instance(l_max, numbers.Integral, name="l_max")
+
+    fft_size = h_f.shape[-1]
+
+    # The inverse DFT determines time lags only modulo fft_size, so an l_min
+    # outside a single period cannot be told apart from its aliases
+    if not -fft_size < l_min < fft_size:
+        raise ValueError(
+            f"l_min (got {l_min}) must satisfy -fft_size < l_min < fft_size "
+            f"(got fft_size={fft_size})."
+        )
+
+    if l_max is None:
+        num_time_lags = fft_size
+    else:
+        if l_max < l_min:
+            raise ValueError(
+                f"l_max (got {l_max}) must be greater than or equal to "
+                f"l_min (got {l_min})."
+            )
+
+        num_time_lags = l_max - l_min + 1
+        if num_time_lags > fft_size:
+            raise ValueError(
+                "The requested number of time lags "
+                f"(got {num_time_lags}) must not exceed fft_size "
+                f"({fft_size})."
+            )
+
+    # Undo the centered subcarrier ordering and compute the inverse DFT
+    h_t = torch.fft.ifftshift(h_f, dim=-1)
+    h_t = torch.fft.ifft(h_t, dim=-1)
+
+    # Reorder the circular time lags and select the requested interval
+    h_t = torch.roll(h_t, shifts=-l_min, dims=-1)
+    h_t = h_t[..., :num_time_lags]
+
+    return h_t
+
+
+def time_to_doppler_channel(
+    h_t: torch.Tensor,
+) -> torch.Tensor:
+    r"""
+    Compute the delay-Doppler channel from a uniformly sampled time-delay
+    channel
+
+    Given channel taps :math:`\bar{h}_{b,\ell}`, the delay-Doppler channel is
+    computed as
+
+    .. math::
+
+        \tilde{h}_{q,\ell}
+        = \frac{1}{S}\sum_{b=0}^{S-1}\bar{h}_{b,\ell}
+          e^{-j\frac{2\pi bq}{S}},
+
+    where :math:`S` is ``num_time_steps``, :math:`b` is the time-step index,
+    :math:`q` is the Doppler-bin index, and :math:`\ell` is the time-lag index.
+
+    :param h_t: Uniformly sampled time-delay channel, shape
+        [..., num_time_steps, num_time_lags]
+
+    :output h_dd: [..., num_doppler_bins, num_time_lags], `torch.complex`.
+        Delay-Doppler channel with centered Doppler-bin ordering, where
+        ``num_doppler_bins = num_time_steps``.
+
+    .. rubric:: Notes
+
+    The zero-Doppler bin is shifted to the center of the Doppler dimension. The
+    output stores the bin for Doppler index :math:`q`, ranging from
+    :math:`-\lfloor S/2\rfloor` to :math:`S-\lfloor S/2\rfloor-1`, at index
+    :math:`q+\lfloor S/2\rfloor`. A positive Doppler shift, i.e., a path
+    coefficient varying as :math:`e^{j2\pi\nu t}` with :math:`\nu>0`, appears
+    at a positive Doppler index.
+
+    Due to the :math:`1/S` normalization, a tap with a Doppler shift on the
+    frequency grid appears in a single bin equal to its coefficient, and the
+    channel energy is preserved,
+    :math:`\sum_{q}|\tilde{h}_{q,\ell}|^2
+    = \frac{1}{S}\sum_{b=0}^{S-1}|\bar{h}_{b,\ell}|^2`, i.e., the energy summed
+    over the Doppler bins equals the energy averaged over the time steps.
+
+    This function does not compute physical Doppler frequencies. The frequency
+    of each output bin is obtained from
+    :func:`~sionna.phy.channel.time_frequency_vector`, called with the
+    time spacing between consecutive channel observations, whose frequency
+    vector uses the same centered ordering.
+
+    See also :func:`~sionna.phy.channel.ofdm_to_time_channel` and
+    :func:`~sionna.phy.channel.ofdm_to_delay_doppler_channel`.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import time_to_doppler_channel
+
+        h_t = torch.ones(2, 8, 5, dtype=torch.complex64)
+        h_dd = time_to_doppler_channel(h_t)
+        print(h_dd.shape)
+        # torch.Size([2, 8, 5])
+    """
+    h_dd = torch.fft.fft(h_t, dim=-2, norm="forward")
+    h_dd = torch.fft.fftshift(h_dd, dim=-2)
+
+    return h_dd
+
+
+def ofdm_to_delay_doppler_channel(
+    h_f: torch.Tensor,
+    l_min: int = 0,
+    l_max: Optional[int] = None,
+) -> torch.Tensor:
+    r"""
+    Compute the delay-Doppler channel from a channel frequency response on a
+    complete OFDM time-frequency grid
+
+    Given a channel frequency response :math:`\hat{h}_{b,n}`, the
+    delay-Doppler channel is computed as
+
+    .. math::
+
+        \tilde{h}_{q,\ell}
+        = \frac{1}{NS}\sum_{b=0}^{S-1}\sum_{n=0}^{N-1}
+          \hat{h}_{b,n}
+          e^{j\frac{2\pi n\ell}{N}}
+          e^{-j\frac{2\pi bq}{S}},
+
+    for :math:`\ell=L_\text{min},\ldots,L_\text{max}`, where :math:`N` is
+    ``fft_size``, :math:`S` is ``num_time_steps``, :math:`b` is the time-step
+    index, :math:`n` is the frequency-bin index after undoing the centered
+    subcarrier ordering, :math:`q` is the Doppler-bin index, and :math:`\ell`
+    is the time-lag index. If ``l_max`` is `None`,
+    :math:`L_\text{max}=L_\text{min}+N-1`.
+
+    :param h_f: Channel frequency responses on a complete, uniformly spaced
+        OFDM frequency grid in centered subcarrier order, shape
+        [..., num_time_steps, fft_size]
+    :param l_min: Smallest time-lag for the discrete complex-baseband channel
+        impulse response (:math:`L_{\text{min}}`). Defaults to 0.
+    :param l_max: Largest time-lag for the discrete complex-baseband channel
+        impulse response (:math:`L_{\text{max}}`). If `None`, all
+        ``fft_size`` lags starting at ``l_min`` are returned. Defaults to
+        `None`.
+
+    :output h_dd: [..., num_doppler_bins, num_time_lags], `torch.complex`.
+        Delay-Doppler channel with centered Doppler-bin ordering, where
+        ``num_doppler_bins = num_time_steps``. If ``l_max`` is `None`,
+        ``num_time_lags = fft_size``; otherwise,
+        ``num_time_lags = l_max-l_min+1``.
+
+    .. rubric:: Notes
+
+    This function is the composition of
+    :func:`~sionna.phy.channel.ofdm_to_time_channel` and
+    :func:`~sionna.phy.channel.time_to_doppler_channel`. The OFDM input must
+    contain a complete, uniformly spaced DFT grid.
+
+    A path with a delay and a Doppler shift on the grid appears in a single
+    bin equal to its path coefficient. The channel energy is preserved,
+    :math:`\sum_{q,\ell}|\tilde{h}_{q,\ell}|^2
+    = \frac{1}{NS}\sum_{b=0}^{S-1}\sum_{n=0}^{N-1}|\hat{h}_{b,n}|^2`, if all
+    ``fft_size`` lags are returned. Selecting fewer lags can only reduce the
+    energy.
+
+    The delay of time lag :math:`\ell` is :math:`\ell/W`, where :math:`W` is
+    the bandwidth, and the frequency of each Doppler bin is obtained from
+    :func:`~sionna.phy.channel.time_frequency_vector`.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import matplotlib.pyplot as plt
+        import torch
+        from sionna.phy import PI
+        from sionna.phy.channel import (cir_to_ofdm_channel,
+            ofdm_to_delay_doppler_channel, subcarrier_frequencies)
+        from sionna.phy.isac import plot_delay_doppler
+
+        # OFDM sensing waveform with one channel observation per OFDM symbol
+        fft_size = 256
+        subcarrier_spacing = 30e3
+        num_time_steps = 128
+        bandwidth = fft_size*subcarrier_spacing
+        observation_spacing = 1/subcarrier_spacing
+
+        # Two targets, each with a delay, a Doppler shift, and a path gain
+        delays = torch.tensor([1.2e-6, 3.0e-6])
+        dopplers = torch.tensor([3.5e3, -9.0e3])
+        gains = torch.tensor([1., 0.5])
+
+        # Time-varying path coefficients a_m(t) = g_m e^{j2 pi nu_m t}
+        t = torch.arange(num_time_steps)*observation_spacing
+        a = gains[:, None]*torch.polar(torch.ones(2, num_time_steps),
+                                       2*PI*dopplers[:, None]*t)
+        a = a.reshape(1, 1, 1, 1, 1, 2, num_time_steps)
+        tau = delays.reshape(1, 1, 1, 2)
+
+        # Compute the OFDM channel and convert it to the delay-Doppler domain
+        frequencies = subcarrier_frequencies(fft_size, subcarrier_spacing)
+        h_f = cir_to_ofdm_channel(frequencies, a, tau)
+        h_dd = ofdm_to_delay_doppler_channel(h_f).squeeze()
+
+        # Show the delay-Doppler map around the targets. The sample rates
+        # turn the lag and Doppler bin indices into delays and frequencies.
+        num_lags = 40
+        fig, ax = plot_delay_doppler(
+            h_dd[:, :num_lags].abs().square(),
+            fast_time_sample_rate=bandwidth,
+            slow_time_sample_rate=1/observation_spacing)
+        ax.scatter(delays*1e6, dopplers/1e3, marker="x", c="red",
+                   label="Target")
+        ax.legend()
+        plt.show()
+
+    .. figure:: /phy/figures/ofdm_to_delay_doppler_channel.png
+        :align: center
+        :width: 80%
+
+        Delay-Doppler channel of two targets. The peaks coincide with the
+        target delays and Doppler shifts.
+    """
+    h_t = ofdm_to_time_channel(h_f, l_min, l_max)
+    h_dd = time_to_doppler_channel(h_t)
+
+    return h_dd
 
 
 def deg_2_rad(x: torch.Tensor) -> torch.Tensor:
@@ -603,7 +1005,7 @@ def drop_uts_in_sector(
     :param num_ut: Number of UTs to sample per batch example
     :param min_bs_ut_dist: Minimum BS-UT distance [m]
     :param isd: Inter-site distance, i.e., the distance between two adjacent
-        BSs [m]
+        base stations [m]
     :param bs_height: BS height, i.e., distance between the BS and the X-Y
         plane [m]. Defaults to 0.0.
     :param ut_height: UT height, i.e., distance between the UT and the X-Y
@@ -726,7 +1128,10 @@ def set_3gpp_scenario_parameters(
 
     If a parameter is given, then it is returned. If it is set to `None`,
     then a parameter valid according to the chosen scenario is returned
-    (see :cite:p:`TR38901`).
+    (see :cite:p:`TR38901V1920`).
+    The default minimum BS-UT distances for the UMi and UMa scenarios,
+    including their calibration variants, are 10 m and 35 m, respectively,
+    as specified in Table 7.8-1 of :cite:p:`TR38901V160100`.
 
     :param scenario: System level model scenario. One of ``"uma"``,
         ``"umi"``, ``"rma"``, ``"uma-calibration"``, or
@@ -736,7 +1141,11 @@ def set_3gpp_scenario_parameters(
     :param bs_height: BS elevation [m]
     :param min_ut_height: Minimum UT elevation [m]
     :param max_ut_height: Maximum UT elevation [m]
-    :param indoor_probability: Probability of a UT to be indoor
+    :param indoor_probability: Probability of a UT to be indoor. For RMa, the
+        remaining UTs are interpreted as in-car by
+        :class:`~sionna.phy.channel.tr38901.RMa` unless an explicit ``in_car``
+        mask is passed to
+        :meth:`~sionna.phy.channel.tr38901.RMa.set_topology`.
     :param min_ut_velocity: Minimum UT velocity [m/s]
     :param max_ut_velocity: Maximum UT velocity [m/s]
     :param precision: Precision used for internal calculations and outputs.
@@ -767,14 +1176,49 @@ def set_3gpp_scenario_parameters(
 
     :output max_ut_velocity: `torch.float`.
         Maximum UT velocity [m/s].
+
+    .. rubric:: Examples
+
+    The returned tensors can be passed to topology-generation helpers that
+    require scenario-dependent defaults.
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import (
+            generate_uts_topology,
+            set_3gpp_scenario_parameters,
+        )
+
+        params = set_3gpp_scenario_parameters("umi")
+        (min_bs_ut_dist, isd, bs_height, min_ut_height, max_ut_height,
+         indoor_probability, min_ut_velocity, max_ut_velocity) = params
+
+        ut_loc, ut_orientations, ut_velocities, in_state = generate_uts_topology(
+            batch_size=1,
+            num_ut=4,
+            drop_area="sector",
+            cell_loc_xy=torch.zeros(1, 1, 2),
+            min_bs_ut_dist=min_bs_ut_dist,
+            isd=isd,
+            min_ut_height=min_ut_height,
+            max_ut_height=max_ut_height,
+            indoor_probability=indoor_probability,
+            min_ut_velocity=min_ut_velocity,
+            max_ut_velocity=max_ut_velocity,
+        )
     """
-    assert scenario in (
+    if scenario not in (
         "umi",
         "uma",
         "rma",
         "umi-calibration",
         "uma-calibration",
-    ), "`scenario` must be one of 'umi', 'uma', 'rma', 'umi-calibration', 'uma-calibration'"
+    ):
+        raise ValueError(
+            "`scenario` must be one of 'umi', 'uma', 'rma', "
+            "'umi-calibration', 'uma-calibration'"
+        )
 
     if precision is None:
         dtype = config.dtype
@@ -799,7 +1243,7 @@ def set_3gpp_scenario_parameters(
             "max_ut_velocity": 0.0,
         },
         "umi-calibration": {
-            "min_bs_ut_dist": 0.0,
+            "min_bs_ut_dist": 10.0,
             "isd": 200.0,
             "bs_height": 10.0,
             "min_ut_height": 1.5,
@@ -819,7 +1263,7 @@ def set_3gpp_scenario_parameters(
             "max_ut_velocity": 0.0,
         },
         "uma-calibration": {
-            "min_bs_ut_dist": 0.0,
+            "min_bs_ut_dist": 35.0,
             "isd": 500.0,
             "bs_height": 25.0,
             "min_ut_height": 1.5,
@@ -988,10 +1432,8 @@ def generate_uts_topology(
         Indoor/outdoor state of UTs. `True` means indoor, `False` means
         outdoor.
     """
-    assert drop_area in (
-        "sector",
-        "cell",
-    ), "Drop area must be either 'sector' or 'cell'"
+    if drop_area not in ("sector", "cell"):
+        raise ValueError("Drop area must be either 'sector' or 'cell'")
 
     if precision is None:
         dtype = config.dtype
@@ -1218,7 +1660,7 @@ def gen_single_sector_topology(
 
     The drop configuration can be controlled through the optional parameters.
     Parameters set to `None` are set to valid values according to the chosen
-    ``scenario`` (see :cite:p:`TR38901`).
+    ``scenario`` (see :cite:p:`TR38901V1920`).
 
     The returned batch of topologies can be used as-is with the
     :meth:`set_topology` method of the system level models, i.e.
@@ -1236,7 +1678,11 @@ def gen_single_sector_topology(
     :param bs_height: BS elevation [m]
     :param min_ut_height: Minimum UT elevation [m]
     :param max_ut_height: Maximum UT elevation [m]
-    :param indoor_probability: Probability of a UT to be indoor
+    :param indoor_probability: Probability of a UT to be indoor. For RMa, the
+        remaining UTs are interpreted as in-car by
+        :class:`~sionna.phy.channel.tr38901.RMa` unless an explicit ``in_car``
+        mask is passed to
+        :meth:`~sionna.phy.channel.tr38901.RMa.set_topology`.
     :param min_ut_velocity: Minimum UT velocity [m/s]
     :param max_ut_velocity: Maximum UT velocity [m/s]
     :param precision: Precision used for internal calculations and outputs.
@@ -1261,7 +1707,10 @@ def gen_single_sector_topology(
 
     :output in_state: [batch_size, num_ut], `torch.bool`.
         Indoor/outdoor state of UTs. `True` means indoor, `False` means
-        outdoor.
+        outdoor. For RMa, the initial
+        :meth:`~sionna.phy.channel.tr38901.RMa.set_topology` call interprets
+        every `False` entry as in-car per Table 7.2-3 unless ``in_car`` is
+        supplied explicitly.
 
     .. rubric:: Examples
 
@@ -1420,7 +1869,7 @@ def gen_single_sector_topology_interferers(
 
     The drop configuration can be controlled through the optional parameters.
     Parameters set to `None` are set to valid values according to the chosen
-    ``scenario`` (see :cite:p:`TR38901`).
+    ``scenario`` (see :cite:p:`TR38901V1920`).
 
     The returned batch of topologies can be used as-is with the
     :meth:`set_topology` method of the system level models, i.e.
@@ -1444,7 +1893,11 @@ def gen_single_sector_topology_interferers(
     :param bs_height: BS elevation [m]
     :param min_ut_height: Minimum UT elevation [m]
     :param max_ut_height: Maximum UT elevation [m]
-    :param indoor_probability: Probability of a UT to be indoor
+    :param indoor_probability: Probability of a UT to be indoor. For RMa, the
+        remaining UTs are interpreted as in-car by
+        :class:`~sionna.phy.channel.tr38901.RMa` unless an explicit ``in_car``
+        mask is passed to
+        :meth:`~sionna.phy.channel.tr38901.RMa.set_topology`.
     :param min_ut_velocity: Minimum UT velocity [m/s]
     :param max_ut_velocity: Maximum UT velocity [m/s]
     :param precision: Precision used for internal calculations and outputs.
@@ -1476,7 +1929,10 @@ def gen_single_sector_topology_interferers(
 
     :output in_state: [batch_size, num_ut + num_interferer], `torch.bool`.
         Indoor/outdoor state of UTs. `True` means indoor, `False` means
-        outdoor. The first ``num_ut`` items along the axis with
+        outdoor. For RMa, the initial
+        :meth:`~sionna.phy.channel.tr38901.RMa.set_topology` call interprets
+        every `False` entry as in-car per Table 7.2-3 unless ``in_car`` is
+        supplied explicitly. The first ``num_ut`` items along the axis with
         index 1 correspond to the served UTs, whereas the remaining
         ``num_interferer`` items correspond to the interfering UTs.
 
@@ -1761,12 +2217,13 @@ def exp_corr_mat(
         a = a.to(dtype=cdtype, device=device)
     a = a.unsqueeze(-1)
 
-    # Check that a is valid (skip in compiled mode to avoid graph breaks)
-    if not torch.compiler.is_compiling():
-        if torch.any(torch.abs(a) >= 1):
-            raise ValueError(
-                "The absolute value of the elements of `a` must be smaller than one"
-            )
+    check_tensor_all(
+        torch.abs(a) < 1,
+        name="a",
+        message=(
+            "The absolute value of the elements of `a` must be smaller than one"
+        ),
+    )
 
     # Vector of exponents, adapt dtype and dimensions for broadcasting
     exp = torch.arange(0, n, device=device)
@@ -1858,7 +2315,11 @@ def one_ring_corr_mat(
         device = config.device
 
     if sigma_phi_deg > 15:
-        warnings.warn("sigma_phi_deg should be smaller than 15.")
+        warnings.warn(
+            "sigma_phi_deg should be smaller than 15.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Convert all inputs to radians
     if not isinstance(phi_deg, torch.Tensor):
